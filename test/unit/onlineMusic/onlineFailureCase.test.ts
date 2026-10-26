@@ -4,7 +4,7 @@ import { listOnlineMusicProviders } from '@/services/onlineMusic/providerRegistr
 import { OnlineProviderError } from '@/types/onlineMusic';
 import type { OnlineFailureDetail, ProviderErrorCode } from '@/types/onlineMusic';
 import {
-    ONLINE_FAILURE_CASE_IDS, autoRetryDelaysMs, logOnlineFailure, mediaFailureOf, noteOnlineFailure, offersRetry, onlineFailureOf, stopsPlayback,
+    ONLINE_FAILURE_CASE_IDS, autoRetryDelaysMs, logOnlineFailure, mediaFailureOf, noteOnlineFailure, offersRetry, onlineFailureOf, skipsWithoutWaiting, stopsPlayback,
 } from '@/services/onlineMusic/failure/onlineFailureCase';
 import { OnlineRequestTimeout } from '@/services/onlineMusic/failure/onlineRequestLimit';
 
@@ -109,6 +109,13 @@ describe('the table', () => {
     it('offers a retry where asking again may help', () => {
         const retrying = ONLINE_FAILURE_CASE_IDS.filter(id => offersRetry(audio({ case: id })));
         expect(retrying.sort()).toEqual(['local-service-stopped', 'refused', 'unknown', 'unreachable']);
+    });
+
+    it('skips without waiting past the songs only this song can explain, not past a refusal or a network problem', () => {
+        const instant = ONLINE_FAILURE_CASE_IDS.filter(id => skipsWithoutWaiting(audio({ case: id })));
+        expect(instant.sort()).toEqual(['audio-unplayable', 'no-audio', 'not-public', 'taken-down']);
+        expect(skipsWithoutWaiting(audio({ case: 'preview-only' }))).toBe(false);
+        expect(skipsWithoutWaiting(audio({ case: 'unreachable' }))).toBe(false);
     });
 });
 

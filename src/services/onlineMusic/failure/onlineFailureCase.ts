@@ -31,7 +31,7 @@ export interface OnlineFailure {
 // retry：没有下一首可跳时给一个「重试」（再要一次可能就好了的几种）。
 // unplayable：「无法播放时自动跳过」打开时也倒数跳过的停下的几种：这首歌在这个账号上放不了，跳过它，
 // 下一首多半能放。登录和服务没配好不在里面：登录了、配好了这首就能放，下一首也一样放不了。
-const CASES: Record<OnlineFailureCaseId, { stops: boolean; retry: boolean; unplayable?: true }> = {
+const CASES: Record<OnlineFailureCaseId, { stops: boolean; retry: boolean; unplayable?: true; instant?: true }> = {
     unreachable: { stops: false, retry: true },
     'local-service-stopped': { stops: false, retry: true },
     'retry-later': { stops: false, retry: false },
@@ -45,10 +45,10 @@ const CASES: Record<OnlineFailureCaseId, { stops: boolean; retry: boolean; unpla
     'region-restricted': { stops: true, retry: false, unplayable: true },
     'not-configured': { stops: true, retry: false },
     // 只有平台的记录说它下架了才是这一种（getAvailability），或者 provider 自己点名。
-    'taken-down': { stops: false, retry: false },
-    'no-audio': { stops: false, retry: false },
-    'audio-unplayable': { stops: false, retry: false },
-    'not-public': { stops: false, retry: false },
+    'taken-down': { stops: false, retry: false, instant: true },
+    'no-audio': { stops: false, retry: false, instant: true },
+    'audio-unplayable': { stops: false, retry: false, instant: true },
+    'not-public': { stops: false, retry: false, instant: true },
     refused: { stops: false, retry: true },
     unknown: { stops: false, retry: true },
 };
@@ -63,6 +63,12 @@ export const stopsPlayback = (shown: OnlineFailure, autoSkipUnplayable = false):
     CASES[shown.case].stops && !(autoSkipUnplayable && CASES[shown.case].unplayable)
 );
 export const offersRetry = (shown: OnlineFailure): boolean => CASES[shown.case].retry;
+
+/**
+ * 这首放不了、再要一次也是同一句（下架、平台不对外、没有可播的地址）：播放不倒数、不停下，
+ * 直接接下一首。这几个是这首自己的事，换一首就好；登录、会员、地区、网络不是，那些仍然停下或倒数。
+ */
+export const skipsWithoutWaiting = (shown: OnlineFailure): boolean => CASES[shown.case].instant === true;
 
 /**
  * 要地址的请求连不上时，先自己再要几次，每次之前等这么久；都不行才告诉用的人。到了时限的请求只再要一次：

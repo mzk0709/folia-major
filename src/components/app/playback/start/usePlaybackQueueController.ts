@@ -55,7 +55,7 @@ import { setAudioSrc, setCachedCoverUrl, setCurrentLineIndex, setCurrentSong, se
 import { askedSongKeyRef, askForSong, playsDroppedSoFar, showSong, startOfAskedSong, startPlay, withdrawAsk } from '../currentSong';
 import { loadOnlineSongAudio } from '../source/songAudioSource';
 import { onlineFailureToast } from '../source/onlineFailureToast';
-import { offersRetry, onlineFailureOf, stopsPlayback, type OnlineFailure } from '../../../../services/onlineMusic/failure/onlineFailureCase';
+import { offersRetry, onlineFailureOf, skipsWithoutWaiting, stopsPlayback, type OnlineFailure } from '../../../../services/onlineMusic/failure/onlineFailureCase';
 import { openLoginWindow } from '../../../login/loginWindowStore';
 import { useTranslation } from 'react-i18next';
 import { currentTime } from '../../../../stores/motionSignals';
@@ -157,6 +157,11 @@ type UsePlaybackQueueControllerParams = {
 };
 
 const MAX_UNAVAILABLE_AUTO_SKIP_COUNT = 2;
+// 「这首放不了」的几种（下架、不对外、没有可播的地址）不倒数，直接往下跳：连着几首放不了也不停下来，
+// 一个队列里放不了的歌常常挨在一起。上限只防「整队都放不了又循环」时无休止地一首首要地址。
+const MAX_UNAVAILABLE_INSTANT_SKIP_COUNT = 20;
+// 直接跳过时那条说原因的提示自己收起的时间：比倒数的 5 秒短，也不占着下一首的提示。
+const INSTANT_SKIP_TOAST_MS = 2500;
 const UNAVAILABLE_SKIP_CONFIRM_TIMEOUT_MS = 5000;
 const UNAVAILABLE_SKIP_CONFIRM_INTERVAL_MS = 1000;
 // The nonce of a skip prompt's toast: one toast for the whole count, and a new one for the next song's,
@@ -666,8 +671,12 @@ export function usePlaybackQueueController({
                 return;
             }
             const nextSong = getNextPlayableQueueSong(queueContext, song, isFmCall);
-            if (nextSong && skipCount < MAX_UNAVAILABLE_AUTO_SKIP_COUNT) {
-                showTimedSkipPrompt(said, () => {
+            // 平台已经说了这首放不了（下架、不对外、没有可播的地址）：再要一次也是同一句，所以不倒数、
+            // 不停下，直接接下一首。免得一段放不了的歌把整队在中间停下来。
+            const instantSkip = skipsWithoutWaiting(shown);
+            const skipLimit = instantSkip ? MAX_UNAVAILABLE_INSTANT_SKIP_COUNT : MAX_UNAVAILABLE_AUTO_SKIP_COUNT;
+            if (nextSong && skipCount < skipLimit) {
+                const skipToNext = () => {
                     if (!isLatestPlaybackRequest()) return;
                     // The queue was replaced whole meanwhile: the skip steps through the queue and FM of now
                     // from this song (from the first entry when the new queue does not hold it), as a skip
@@ -688,7 +697,15 @@ export function usePlaybackQueueController({
                         ...deferredPlayOptions,
                         unavailableSkipCount: skipCount + 1,
                     });
-                }, stopsPlayback(shown) ? () => { if (isLatestPlaybackRequest()) stopHere(); } : undefined);
+                };
+                if (instantSkip) {
+                    // 提示照说一次，但不守着它：不等 5 秒，下一首立刻开始。
+                    setStatusMsg({ ...said, durationMs: INSTANT_SKIP_TOAST_MS });
+                    skipToNext();
+                    tellFailure(shown, true);
+                    return;
+                }
+                showTimedSkipPrompt(said, skipToNext, stopsPlayback(shown) ? () => { if (isLatestPlaybackRequest()) stopHere(); } : undefined);
                 tellFailure(shown, true);
                 return;
             }
@@ -1360,7 +1377,11 @@ export function usePlaybackQueueController({
             return;
         }
 
-        if (!hasNextTrack || skipCount >= MAX_UNAVAILABLE_AUTO_SKIP_COUNT) {
+        // 平台已经说了这首放不了：和 playSong 里一样不倒数，直接往下跳；别的失败仍按原来倒计时或停下。
+        const instantSkip = Boolean(shown && skipsWithoutWaiting(shown));
+        const skipLimit = instantSkip ? MAX_UNAVAILABLE_INSTANT_SKIP_COUNT : MAX_UNAVAILABLE_AUTO_SKIP_COUNT;
+
+        if (!hasNextTrack || skipCount >= skipLimit) {
             if (shown && stopsPlayback(shown)) {
                 stopHere(shown);
                 tell(false);
@@ -1388,6 +1409,22 @@ export function usePlaybackQueueController({
         }
 
         const nextSkipCount = skipCount + 1;
+        if (instantSkip) {
+            // 不守着提示：下一首立刻开始，说明的提示 2.5 秒后自己收起。
+            playbackAutoSkipCountRef.current = nextSkipCount;
+            setStatusMsg({ ...said, durationMs: INSTANT_SKIP_TOAST_MS });
+            // The newest handleNextTrack: the queue as it is when the skip comes, edits made meanwhile kept.
+            void latestQueueActionsRef.current.handleNextTrack({
+                allowStopOnMissing: true,
+                shouldNavigateToPlayer: false,
+                unavailableSkipCount: nextSkipCount,
+                // The track that failed is the one on the active deck, which mid-blend is NOT the
+                // one on screen. Skipping from the displayed track would step onto the broken one.
+                fromSong: currentSong ?? undefined,
+            });
+            tell(true);
+            return;
+        }
         showTimedSkipPrompt(said, () => {
             playbackAutoSkipCountRef.current = nextSkipCount;
             // The newest handleNextTrack: the queue as it is when the skip comes, edits made meanwhile kept.
