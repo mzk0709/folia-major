@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import type React from 'react';
 import type { MotionValue } from 'framer-motion';
 import { omni } from '../../../../services/onlineMusic/omni';
@@ -19,6 +19,7 @@ import { currentTime } from '../../../../stores/motionSignals';
 import { errorFields } from '../../../../utils/errorText';
 import { hifiTransport, isHifiRoute } from '../../../../services/hifi/hifiPlayback';
 import { seekHifiRoute } from '../../../hifi/hifiRouteTransport';
+import { resolveWheelTrackStep } from './wheelTrackStep';
 
 // src/components/app/playback/bridges/usePlaybackInteractionBridge.ts
 
@@ -41,6 +42,36 @@ export const resolvePlayerEscapeAction = ({
     if (isFullscreen) return 'allow-fullscreen-exit';
     return isPanelOpen ? 'close-panel' : 'navigate-back';
 };
+
+// How far up from the wheel target the scrollable check walks. The player page itself does not
+// scroll - that space is what the wheel steps tracks in - but lists, lyric rails and scrolling
+// panels do live inside it, and their wheel belongs to them. Six levels covers the wrappers between
+// a row and the box that scrolls it.
+const WHEEL_SCROLL_ANCESTOR_LIMIT = 6;
+
+const hasScrollableWheelAncestor = (target: EventTarget | null) => {
+    if (!(target instanceof Element)) {
+        return false;
+    }
+
+    let element: Element | null = target;
+    for (let depth = 0; element && depth < WHEEL_SCROLL_ANCESTOR_LIMIT; depth += 1) {
+        if (element.scrollHeight > element.clientHeight) {
+            const overflowY = window.getComputedStyle(element).overflowY;
+            if (overflowY === 'auto' || overflowY === 'scroll') {
+                return true;
+            }
+        }
+        element = element.parentElement;
+    }
+    return false;
+};
+
+// 滑杆（面板的音量、设置里的滑杆）也是应用画的控件，焦点或光标在它上面时滚轮归它，
+// 不拿来切歌 —— 与 isSliderKey 同一个判断，只是这里没有按键可看。
+const isSliderWheelTarget = (target: EventTarget | null) => (
+    target instanceof Element && target.closest('[role="slider"]') !== null
+);
 
 type UsePlaybackInteractionBridgeParams = {
     stageActiveEntryKind: string | null;
@@ -109,6 +140,11 @@ export function usePlaybackInteractionBridge({
     // track's, so clamping an arrow-key seek against it would land past the end of the one heard.
     const duration = usePlaybackStore(selectDisplayDuration);
     const handleToggleLoopMode = useAudioSettingsStore(state => state.handleToggleLoopMode);
+
+    // Wheel track switching state. Refs, not state: a wheel burst arrives dozens of times a second
+    // and neither number is drawn anywhere.
+    const wheelAccumulatorRef = useRef(0);
+    const wheelLastStepAtRef = useRef<number | null>(null);
 
     // resumePlayback rethrows after showing the error toast so awaiting callers can react, but
     // togglePlay is fire-and-forget: without this the rejection escapes as an unhandled promise
@@ -396,6 +432,51 @@ export function usePlaybackInteractionBridge({
         syncStageLyricsClock,
         togglePlay,
     ]);
+
+    // The wheel on the full-player page is track switching: a notch down is the next song, a notch up
+    // the previous one. Hanging it on window because the page has no single element to hang it on, and
+    // registering it non-passive because a notch that switched tracks must not also scroll the box
+    // behind it. Everything else is left alone: outside the player view, or over anything that scrolls
+    // on its own, the wheel keeps its normal job and is never preventDefault-ed.
+    useEffect(() => {
+        const handleWheel = (event: WheelEvent) => {
+            // A trackpad pinch arrives as ctrl+wheel: that is the browser's zoom gesture, not a track
+            // change, and swallowing it here would both zoom and switch a song.
+            if (event.ctrlKey) {
+                return;
+            }
+            const now = performance.now();
+            const lastStepAt = wheelLastStepAtRef.current;
+            const { decision, accumulated } = resolveWheelTrackStep({
+                deltaY: event.deltaY,
+                deltaMode: event.deltaMode,
+                elapsedSecondsSinceLastStep: lastStepAt === null ? null : (now - lastStepAt) / 1000,
+                accumulated: wheelAccumulatorRef.current,
+                isPlayerView: currentView === 'player',
+                isPanelOpen,
+                hasOpenSheet: hasOpenSheet(),
+                hasBlockingWindow: hasBlockingWindow(),
+                hasCurrentSong: currentSong !== null,
+                isEditableTarget: isTextEntryTarget(event.target) || isSliderWheelTarget(event.target),
+                isScrollableTarget: hasScrollableWheelAncestor(event.target),
+            });
+            wheelAccumulatorRef.current = accumulated;
+            if (decision === 'none') {
+                return;
+            }
+
+            wheelLastStepAtRef.current = now;
+            event.preventDefault();
+            if (decision === 'next') {
+                void handleNextTrack();
+            } else {
+                handlePrevTrack();
+            }
+        };
+
+        window.addEventListener('wheel', handleWheel, { passive: false });
+        return () => window.removeEventListener('wheel', handleWheel);
+    }, [currentSong, currentView, handleNextTrack, handlePrevTrack, isPanelOpen]);
 
     // Wrapped so the callbacks this hook hands back keep one identity for the app's lifetime. They
     // are all invoked from events or effects, and their churn was what kept every build*Model memo
